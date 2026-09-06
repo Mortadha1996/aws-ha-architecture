@@ -12,11 +12,11 @@ The interesting part isn't the architecture diagram. It's what happens when an i
                         Internet
                             │
                             ▼
-              ┌──────────────────────────┐
-              │  Application Load Balancer│
+              ┌───────────────────────────┐
+              │ Application Load Balancer │
               │  (public subnets, 2 AZs)  │
               │  health checks every 30s  │
-              └────────────┬─────────────┘
+              └────────────┬──────────────┘
                            │
          ┌─────────────────┴─────────────────┐
          ▼                                   ▼
@@ -29,10 +29,10 @@ The interesting part isn't the architecture diagram. It's what happens when an i
 └──────────────────┘                └──────────────────┘
          └─────────────────┬─────────────────┘
                            │
-              ┌────────────▼─────────────┐
-              │   Auto Scaling Group      │
-              │   min 2 · max 4           │
-              │   target tracking @ 60%   │
+              ┌────────────▼──────────────┐
+              │    Auto Scaling Group     │
+              │    min 2 · max 4          │
+              │    target tracking @ 60%  │
               └───────────────────────────┘
 ```
 
@@ -43,6 +43,24 @@ The interesting part isn't the architecture diagram. It's what happens when an i
 **Auto Scaling Group** maintaining a minimum of two instances, using ELB health checks rather than EC2 status checks, with target tracking on average CPU.
 
 **Security groups chained by reference**, not by CIDR — the web tier accepts traffic from the ALB security group only, so instances are unreachable from the internet even though they sit in public subnets.
+
+---
+
+## What it looks like
+
+Same URL, different Availability Zone — the load balancer distributing across both:
+
+![us-east-1a](docs/az-1a.png)
+
+![us-east-1b](docs/az-1b.png)
+
+Target group with both instances healthy:
+
+![Target group](docs/target-group.png)
+
+Auto Scaling Group holding desired capacity:
+
+![Auto Scaling Group](docs/asg-instances.png)
 
 ---
 
@@ -106,9 +124,9 @@ The ALB and the ASG both do health checking, and they react on very different ti
 
 **The ALB** checks every 30 seconds and needs 3 consecutive failures to mark a target unhealthy — but removing it from rotation is immediate once decided. That's why traffic recovered in seconds.
 
-**The ASG** waits out its `health_check_grace_period` (120s here) before acting, because it has to distinguish "this instance is dead" from "this instance is still booting". That's why the replacement took minutes.
+**The ASG** waits out its `health_check_grace_period` (120s here) before acting, because it has to distinguish "this instance is dead" from "this instance is still booting". Killing a healthy instance mid-boot would be worse than waiting.
 
-Setting `health_check_type = "ELB"` on the ASG is what connects the two: without it, the ASG only watches EC2 status checks, which stay green on an instance whose web server has crashed. The instance would keep receiving no traffic from the ALB while the ASG considered it perfectly healthy.
+Setting `health_check_type = "ELB"` on the ASG is what connects the two. Without it, the ASG only watches EC2 status checks — and those stay green on an instance whose web server has crashed. The hardware is fine, the OS is fine, nothing is listening on port 80. You'd end up with an instance receiving no traffic from the ALB that the ASG considers perfectly healthy, indefinitely.
 
 ---
 
@@ -122,6 +140,7 @@ Setting `health_check_type = "ELB"` on the ASG is what connects the two: without
 ├── security-groups.tf   # ALB and web tier, chained by reference
 ├── compute.tf           # ALB, target group, launch template, ASG, scaling policy
 ├── outputs.tf           # VPC ID, subnet IDs, ALB DNS name
+├── docs/                # screenshots
 └── README.md
 ```
 
@@ -159,7 +178,7 @@ This runs on `t3.micro` instances and a single ALB — roughly **$0.04/hour** fo
 
 **Security groups reference each other, not CIDR blocks.** `aws_security_group.web` allows port 80 from `aws_security_group.alb`, not from `10.0.0.0/16`. If the ALB moves, gets rebuilt, or changes IPs, the rule still holds. It's also the only reason instances in public subnets aren't directly reachable.
 
-**The launch template pulls instance metadata via IMDSv2.** The token-based flow (`PUT` to get a token, then `GET` with the token header) is the current standard — IMDSv1's unauthenticated GET was exploitable through SSRF in application code.
+**The launch template pulls instance metadata via IMDSv2.** The token-based flow — `PUT` to get a token, then `GET` with the token header — is the current standard. IMDSv1's unauthenticated GET was exploitable through SSRF in application code.
 
 **Target tracking rather than step scaling.** Telling AWS "keep average CPU at 60%" is simpler and less brittle than defining thresholds and cooldowns by hand.
 
