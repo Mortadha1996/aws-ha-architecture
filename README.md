@@ -25,7 +25,13 @@ The interesting part isn't the architecture diagram. It's what happens when an i
 │  ┌────────────┐  │                │  ┌────────────┐  │
 │  │  EC2 web   │  │                │  │  EC2 web   │  │
 │  │  t3.micro  │  │                │  │  t3.micro  │  │
+│  └─────┬──────┘  │                │  └──────┬─────┘  │
+│        │         │                │         │        │
+│  ┌─────▼──────┐  │                │  ┌──────▼─────┐  │
+│  │ RDS MySQL  │◄─┼── synchronous ─┼─►│  standby   │  │
+│  │  primary   │  │   replication  │  │            │  │
 │  └────────────┘  │                │  └────────────┘  │
+│  (private subnet)│                │ (private subnet) │
 └──────────────────┘                └──────────────────┘
          └─────────────────┬─────────────────┘
                            │
@@ -36,13 +42,15 @@ The interesting part isn't the architecture diagram. It's what happens when an i
               └───────────────────────────┘
 ```
 
-**VPC** spanning two Availability Zones, with public subnets for the load-balanced tier and private subnets reserved for the data tier.
+**VPC** spanning two Availability Zones — public subnets for the load-balanced web tier, private subnets for the database.
 
 **Application Load Balancer** distributing across both AZs, with health checks that pull an unhealthy target out of rotation.
 
 **Auto Scaling Group** maintaining a minimum of two instances, using ELB health checks rather than EC2 status checks, with target tracking on average CPU.
 
-**Security groups chained by reference**, not by CIDR — the web tier accepts traffic from the ALB security group only, so instances are unreachable from the internet even though they sit in public subnets.
+**RDS MySQL Multi-AZ** with a synchronous standby in the second AZ and automatic failover.
+
+**Security groups chained by reference**, not by CIDR — the web tier accepts traffic from the ALB security group only, and the database accepts traffic from the web tier security group only.
 
 ---
 
@@ -64,7 +72,7 @@ Auto Scaling Group holding desired capacity:
 
 ---
 
-## Testing it by breaking it
+## Test 1 — killing a web instance
 
 An architecture is only highly available if you've watched it survive something. So I terminated an instance while a client was hitting the load balancer once per second.
 
@@ -107,8 +115,6 @@ Meanwhile the Auto Scaling Group did its own work:
 +----------------------+--------------+------------+--------------+
 ```
 
-### Measured
-
 | What | Observed |
 |---|---|
 | Failed requests during the event | 1 of ~40 |
@@ -116,9 +122,7 @@ Meanwhile the Auto Scaling Group did its own work:
 | ASG launches replacement | ~2 minutes |
 | AZs serving traffic throughout | 2 |
 
----
-
-## The distinction that matters
+### Why those timescales differ
 
 The ALB and the ASG both do health checking, and they react on very different timescales.
 
@@ -130,16 +134,54 @@ Setting `health_check_type = "ELB"` on the ASG is what connects the two. Without
 
 ---
 
+## Test 2 — forcing an RDS failover
+
+Same principle, different layer. I forced a Multi-AZ failover and read the event log rather than guessing at the numbers.
+
+```bash
+aws rds reboot-db-instance --db-instance-identifier demo-mysql --force-failover
+
+aws rds describe-events --source-identifier demo-mysql \
+  --source-type db-instance --duration 20 \
+  --query 'Events[].[Date,Message]' --output table
+```
+
+```
+2026-09-08T18:09:24  Multi-AZ instance failover started.
+2026-09-08T18:09:39  DB instance restarted
+```
+
+**15 seconds.** The DNS endpoint did not change — `demo-mysql.xxxxx.us-east-1.rds.amazonaws.com` still resolves, now pointing at what used to be the standby. No connection string to update, no config reload. The application never knows a failover happened.
+
+That's the trade being made with Multi-AZ: you pay for compute you never actively use, and in exchange failover is 15 seconds instead of a restore from backup.
+
+### A mistake worth sharing
+
+I first tried to measure the outage by opening a TCP socket to port 3306 from my laptop:
+
+```bash
+timeout 3 bash -c "</dev/tcp/$DB_ENDPOINT/3306" && echo "OK" || echo "FAILED"
+```
+
+Every single attempt returned FAILED — before, during and after the failover. Not because the database was down, but because the database security group only accepts traffic from the web tier security group, and my laptop isn't in the VPC.
+
+The failure to connect was the segmentation working exactly as designed. I was measuring the wrong thing.
+
+The right measurement is the RDS event log, which records the failover with timestamps on both sides.
+
+---
+
 ## Repository layout
 
 ```
 .
 ├── main.tf              # provider, default tags, AZ data source
-├── variables.tf         # region, environment, VPC CIDR
+├── variables.tf         # region, environment, VPC CIDR, DB password
 ├── vpc.tf               # VPC, subnets, IGW, route tables
-├── security-groups.tf   # ALB and web tier, chained by reference
+├── security-groups.tf   # ALB, web and database tiers, chained by reference
 ├── compute.tf           # ALB, target group, launch template, ASG, scaling policy
-├── outputs.tf           # VPC ID, subnet IDs, ALB DNS name
+├── database.tf          # RDS MySQL Multi-AZ, subnet group, security group
+├── outputs.tf           # VPC ID, subnet IDs, ALB DNS name, DB endpoint
 ├── docs/                # screenshots
 └── README.md
 ```
@@ -154,44 +196,47 @@ cd aws-ha-architecture
 
 aws configure          # credentials for a non-root IAM user
 terraform init
-terraform plan
-terraform apply
+terraform apply -var="db_password=YourSecurePassword"
 ```
 
 The ALB DNS name comes out as an output. Hit it a few times and watch the AZ change.
 
 ```bash
-terraform destroy      # when you're done
+terraform destroy -var="db_password=YourSecurePassword"
 ```
+
+RDS Multi-AZ takes 10–15 minutes to provision — AWS builds the primary, the standby in the second AZ, then establishes replication.
 
 ---
 
 ## On cost
 
-This runs on `t3.micro` instances and a single ALB — roughly **$0.04/hour** for the whole stack. Destroy it when you're not using it and the whole exercise costs a couple of dollars.
+Two `t3.micro` instances, one ALB and a `db.t3.micro` in Multi-AZ come to roughly **$0.07/hour**. Destroy it when you're not using it and the whole exercise costs a couple of dollars.
 
-**There is deliberately no NAT Gateway.** At ~$32/month it's the most expensive thing in a small architecture like this, and it exists to give private subnets outbound internet access. For a demo where instances live in public subnets behind strict security groups, it buys nothing. In production, with the web tier in private subnets, it becomes necessary — but it's worth knowing what you're paying for.
+**There is deliberately no NAT Gateway.** At ~$32/month it's the most expensive thing in a small architecture like this, and it exists to give private subnets outbound internet access. The database doesn't need it — RDS is managed, and the web tier sits in public subnets behind strict security groups. In production, with the web tier in private subnets, it becomes necessary. It's worth knowing what you're paying for.
 
 ---
 
 ## Design notes
 
-**Security groups reference each other, not CIDR blocks.** `aws_security_group.web` allows port 80 from `aws_security_group.alb`, not from `10.0.0.0/16`. If the ALB moves, gets rebuilt, or changes IPs, the rule still holds. It's also the only reason instances in public subnets aren't directly reachable.
+**Security groups reference each other, not CIDR blocks.** The web tier allows port 80 from the ALB security group. The database allows port 3306 from the web security group. If any of them are rebuilt or change IPs, the rules still hold — and nothing is reachable from outside the chain.
+
+**The database lives in private subnets from the start.** `publicly_accessible = false` and a subnet group made of private subnets. Putting a database in a public subnet is a mistake worth avoiding upfront rather than fixing after an audit.
+
+**Storage is encrypted at rest** with the default KMS key, and `max_allocated_storage` enables autoscaling so a full disk doesn't take the database down.
 
 **The launch template pulls instance metadata via IMDSv2.** The token-based flow — `PUT` to get a token, then `GET` with the token header — is the current standard. IMDSv1's unauthenticated GET was exploitable through SSRF in application code.
 
 **Target tracking rather than step scaling.** Telling AWS "keep average CPU at 60%" is simpler and less brittle than defining thresholds and cooldowns by hand.
 
-**Private subnets exist but hold nothing yet.** They're where RDS goes next — a database in a public subnet is a mistake worth avoiding from the start rather than fixing later.
-
 ---
 
 ## Next
 
-- RDS MySQL Multi-AZ in the private subnets, with automatic failover
 - S3 and CloudFront for static content
-- CloudWatch alarms on target health and ALB 5xx rates
+- CloudWatch alarms on target health, ALB 5xx rates and RDS connection count
 - HTTPS with ACM and a redirect from port 80
+- Read replica for read scaling
 
 ---
 
